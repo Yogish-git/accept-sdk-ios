@@ -8,8 +8,31 @@
 //
 
 import Foundation
+import Security
+import CommonCrypto
 
 let HTTP_TIMEOUT = TimeInterval(30)
+
+// MARK: - Certificate Pinning Configuration
+private struct CertificatePinning {
+    // Allowed hostnames for Authorize.Net
+    static let allowedHosts = [
+        "api.authorize.net",
+        "apitest.authorize.net"
+    ]
+
+    // SHA-256 hashes of the Subject Public Key Info (SPKI) for Authorize.Net certificates
+    // These should be updated when Authorize.Net rotates their certificates
+    // To obtain these hashes, use: openssl s_client -connect api.authorize.net:443 | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
+    static let pinnedPublicKeyHashes: Set<String> = [
+        // Primary certificate public key hash (Authorize.Net)
+        // IMPORTANT: Replace these placeholder hashes with actual Authorize.Net certificate public key hashes
+        // before deploying to production. Obtain current hashes using the openssl command above.
+        "PLACEHOLDER_HASH_1_REPLACE_WITH_ACTUAL_HASH",
+        // Backup certificate public key hash (for certificate rotation)
+        "PLACEHOLDER_HASH_2_REPLACE_WITH_ACTUAL_HASH"
+    ]
+}
 
 private struct HTTPStatusCode {
     static let kHTTPSuccessCode         = 200
@@ -77,13 +100,94 @@ class HTTPResponse {
 }
 
 class HTTP: NSObject, URLSessionDelegate {
-    
+
     func request(_ request : HttpRequest) -> HTTPResponse {
-        
+
         let urlRequest : NSMutableURLRequest = request.urlRequest()
-                
+
         return self.requestSynchronousData(urlRequest as URLRequest)
-        
+
+    }
+
+    // MARK: - URLSessionDelegate Certificate Pinning
+
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+
+        // Only handle server trust authentication
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let serverTrust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        let host = challenge.protectionSpace.host
+
+        // Verify the host is one of our allowed Authorize.Net hosts
+        guard CertificatePinning.allowedHosts.contains(host) else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        // Perform standard SSL validation first
+        var secResult = SecTrustResultType.invalid
+        let status = SecTrustEvaluate(serverTrust, &secResult)
+
+        guard status == errSecSuccess,
+              secResult == .unspecified || secResult == .proceed else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        // Perform public key pinning validation
+        if validatePinnedPublicKeys(serverTrust: serverTrust) {
+            let credential = URLCredential(trust: serverTrust)
+            completionHandler(.useCredential, credential)
+        } else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+        }
+    }
+
+    // MARK: - Public Key Pinning Validation
+
+    private func validatePinnedPublicKeys(serverTrust: SecTrust) -> Bool {
+        let certificateCount = SecTrustGetCertificateCount(serverTrust)
+
+        // Check each certificate in the chain
+        for index in 0..<certificateCount {
+            guard let certificate = SecTrustGetCertificateAtIndex(serverTrust, index) else {
+                continue
+            }
+
+            // Extract the public key from the certificate
+            guard let publicKey = SecCertificateCopyKey(certificate) else {
+                continue
+            }
+
+            // Get the public key data
+            guard let publicKeyData = SecKeyCopyExternalRepresentation(publicKey, nil) as Data? else {
+                continue
+            }
+
+            // Calculate SHA-256 hash of the public key
+            let publicKeyHash = sha256Hash(data: publicKeyData)
+
+            // Check if this public key hash matches any of our pinned hashes
+            if CertificatePinning.pinnedPublicKeyHashes.contains(publicKeyHash) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func sha256Hash(data: Data) -> String {
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes {
+            _ = CC_SHA256($0.baseAddress, CC_LONG(data.count), &hash)
+        }
+        return Data(hash).base64EncodedString()
     }
     
     fileprivate func requestSynchronousData(_ request: URLRequest) -> HTTPResponse {
