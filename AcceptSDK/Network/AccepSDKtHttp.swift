@@ -23,14 +23,45 @@ private struct CertificatePinning {
 
     // SHA-256 hashes of the Subject Public Key Info (SPKI) for Authorize.Net certificates
     // These should be updated when Authorize.Net rotates their certificates
-    // To obtain these hashes, use: openssl s_client -connect api.authorize.net:443 | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
+    // To obtain these hashes, use:
+    // openssl s_client -connect api.authorize.net:443 -servername api.authorize.net 2>/dev/null | \
+    //   openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
     static let pinnedPublicKeyHashes: Set<String> = [
-        // Primary certificate public key hash (Authorize.Net)
-        // IMPORTANT: Replace these placeholder hashes with actual Authorize.Net certificate public key hashes
-        // before deploying to production. Obtain current hashes using the openssl command above.
-        "PLACEHOLDER_HASH_1_REPLACE_WITH_ACTUAL_HASH",
-        // Backup certificate public key hash (for certificate rotation)
-        "PLACEHOLDER_HASH_2_REPLACE_WITH_ACTUAL_HASH"
+        // Authorize.Net leaf certificate public key hash (api.authorize.net / apitest.authorize.net)
+        "cLXQh6iGA40oLXrKrnJHkf+JkZ94NnwC+JpvQ2pHifo=",
+        // Intermediate CA certificate public key hash (backup pin for certificate rotation)
+        "mombFYgkelED1OHDVo8RitQHj447/vhd9x9eMEJygkg="
+    ]
+
+    // ASN.1 header for RSA 2048-bit public key SPKI encoding
+    // This header is prepended to raw public key bytes to create proper SPKI DER format
+    // Format: SEQUENCE { SEQUENCE { OID rsaEncryption, NULL }, BIT STRING { public key } }
+    static let rsa2048SPKIHeader: [UInt8] = [
+        0x30, 0x82, 0x01, 0x22, 0x30, 0x0d, 0x06, 0x09,
+        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+        0x01, 0x05, 0x00, 0x03, 0x82, 0x01, 0x0f, 0x00
+    ]
+
+    // ASN.1 header for RSA 4096-bit public key SPKI encoding
+    static let rsa4096SPKIHeader: [UInt8] = [
+        0x30, 0x82, 0x02, 0x22, 0x30, 0x0d, 0x06, 0x09,
+        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+        0x01, 0x05, 0x00, 0x03, 0x82, 0x02, 0x0f, 0x00
+    ]
+
+    // ASN.1 header for EC P-256 public key SPKI encoding
+    static let ecdsaSecp256r1SPKIHeader: [UInt8] = [
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+        0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+        0x42, 0x00
+    ]
+
+    // ASN.1 header for EC P-384 public key SPKI encoding
+    static let ecdsaSecp384r1SPKIHeader: [UInt8] = [
+        0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86,
+        0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05, 0x2b,
+        0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00
     ]
 }
 
@@ -131,13 +162,22 @@ class HTTP: NSObject, URLSessionDelegate {
         }
 
         // Perform standard SSL validation first
-        var secResult = SecTrustResultType.invalid
-        let status = SecTrustEvaluate(serverTrust, &secResult)
-
-        guard status == errSecSuccess,
-              secResult == .unspecified || secResult == .proceed else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
+        if #available(iOS 12.0, *) {
+            var error: CFError?
+            let isValid = SecTrustEvaluateWithError(serverTrust, &error)
+            guard isValid, error == nil else {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
+        } else {
+            // Fallback for iOS < 12.0: use deprecated but functional SecTrustEvaluate
+            var secResult = SecTrustResultType.invalid
+            let status = SecTrustEvaluate(serverTrust, &secResult)
+            guard status == errSecSuccess,
+                  secResult == .unspecified || secResult == .proceed else {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
         }
 
         // Perform public key pinning validation
@@ -145,6 +185,7 @@ class HTTP: NSObject, URLSessionDelegate {
             let credential = URLCredential(trust: serverTrust)
             completionHandler(.useCredential, credential)
         } else {
+            // Fail closed: reject connection if pinning validation fails
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
@@ -152,6 +193,14 @@ class HTTP: NSObject, URLSessionDelegate {
     // MARK: - Public Key Pinning Validation
 
     private func validatePinnedPublicKeys(serverTrust: SecTrust) -> Bool {
+        // iOS 12.0+ required for SecCertificateCopyKey
+        // For older iOS versions, fail closed (reject connection) for security
+        guard #available(iOS 12.0, *) else {
+            // Fail closed on older iOS versions that don't support required Security APIs
+            // This ensures no unvalidated connections are allowed
+            return false
+        }
+
         let certificateCount = SecTrustGetCertificateCount(serverTrust)
 
         // Check each certificate in the chain
@@ -165,13 +214,23 @@ class HTTP: NSObject, URLSessionDelegate {
                 continue
             }
 
-            // Get the public key data
+            // Get the raw public key data
             guard let publicKeyData = SecKeyCopyExternalRepresentation(publicKey, nil) as Data? else {
                 continue
             }
 
-            // Calculate SHA-256 hash of the public key
-            let publicKeyHash = sha256Hash(data: publicKeyData)
+            // Get the key type and size to determine correct SPKI header
+            guard let keyAttributes = SecKeyCopyAttributes(publicKey) as? [String: Any],
+                  let keyType = keyAttributes[kSecAttrKeyType as String] as? String,
+                  let keySize = keyAttributes[kSecAttrKeySizeInBits as String] as? Int else {
+                continue
+            }
+
+            // Construct full SPKI DER by prepending appropriate ASN.1 header to raw key bytes
+            let spkiData = constructSPKIData(publicKeyData: publicKeyData, keyType: keyType, keySize: keySize)
+
+            // Calculate SHA-256 hash of the full SPKI DER
+            let publicKeyHash = sha256Hash(data: spkiData)
 
             // Check if this public key hash matches any of our pinned hashes
             if CertificatePinning.pinnedPublicKeyHashes.contains(publicKeyHash) {
@@ -180,6 +239,43 @@ class HTTP: NSObject, URLSessionDelegate {
         }
 
         return false
+    }
+
+    /// Constructs Subject Public Key Info (SPKI) DER format by prepending the appropriate
+    /// ASN.1 header to raw public key bytes. This matches the format produced by:
+    /// `openssl x509 -pubkey -noout | openssl pkey -pubin -outform der`
+    private func constructSPKIData(publicKeyData: Data, keyType: String, keySize: Int) -> Data {
+        var spkiHeader: [UInt8]
+
+        if keyType == (kSecAttrKeyTypeRSA as String) {
+            switch keySize {
+            case 2048:
+                spkiHeader = CertificatePinning.rsa2048SPKIHeader
+            case 4096:
+                spkiHeader = CertificatePinning.rsa4096SPKIHeader
+            default:
+                // Unknown RSA key size - return raw data (will fail pinning check safely)
+                return publicKeyData
+            }
+        } else if keyType == (kSecAttrKeyTypeECSECPrimeRandom as String) {
+            switch keySize {
+            case 256:
+                spkiHeader = CertificatePinning.ecdsaSecp256r1SPKIHeader
+            case 384:
+                spkiHeader = CertificatePinning.ecdsaSecp384r1SPKIHeader
+            default:
+                // Unknown EC key size - return raw data (will fail pinning check safely)
+                return publicKeyData
+            }
+        } else {
+            // Unknown key type - return raw data (will fail pinning check safely)
+            return publicKeyData
+        }
+
+        // Prepend SPKI header to raw public key data
+        var spkiData = Data(spkiHeader)
+        spkiData.append(publicKeyData)
+        return spkiData
     }
 
     private func sha256Hash(data: Data) -> String {
